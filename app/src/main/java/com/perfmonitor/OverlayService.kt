@@ -10,7 +10,9 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -19,19 +21,32 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import kotlin.math.abs
 
-/** Foreground service that shows a draggable floating bubble with performance data. */
+/** Foreground service that shows a draggable floating bubble with live device data. */
 class OverlayService : Service() {
+
+    companion object {
+        @Volatile
+        var isRunning: Boolean = false
+    }
 
     private lateinit var windowManager: WindowManager
     private lateinit var container: LinearLayout
-    private lateinit var layoutParams: WindowManager.LayoutParams
+    private lateinit var windowParams: WindowManager.LayoutParams
     private lateinit var bubble: TextView
     private lateinit var panel: LinearLayout
     private lateinit var appText: TextView
-    private lateinit var fpsText: TextView
-    private lateinit var tempText: TextView
+    private lateinit var batteryText: TextView
+    private lateinit var deviceText: TextView
     private lateinit var thermalText: TextView
-    private var sampler: PerfSampler? = null
+    private lateinit var ramText: TextView
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val refresh = object : Runnable {
+        override fun run() {
+            render(PerfMonitor.state.value)
+            handler.postDelayed(this, 1000L)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -40,17 +55,20 @@ class OverlayService : Service() {
         startAsForeground()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         buildOverlay()
-        sampler = PerfSampler(this) { render(it) }.also { it.start() }
+        PerfMonitor.acquire(this)
+        isRunning = true
+        handler.post(refresh)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
-        sampler?.stop()
-        sampler = null
+        handler.removeCallbacks(refresh)
+        PerfMonitor.release()
         if (::container.isInitialized) {
             runCatching { windowManager.removeView(container) }
         }
+        isRunning = false
         super.onDestroy()
     }
 
@@ -75,36 +93,46 @@ class OverlayService : Service() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
+    private fun label(): TextView = TextView(this).apply {
+        setTextColor(Color.WHITE)
+        textSize = 13f
+        setPadding(0, dp(2), 0, dp(2))
+        text = "--"
+    }
+
     private fun buildOverlay() {
         bubble = TextView(this).apply {
             text = "--"
             setTextColor(Color.WHITE)
-            textSize = 13f
+            textSize = 14f
             gravity = Gravity.CENTER
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(Color.argb(230, 20, 20, 30))
+                setColor(Color.argb(235, 16, 22, 34))
                 setStroke(dp(2), Color.rgb(34, 211, 238))
             }
-            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+            this.layoutParams = LinearLayout.LayoutParams(dp(60), dp(60))
         }
 
         appText = label()
-        fpsText = label()
-        tempText = label()
+        batteryText = label()
+        deviceText = label()
         thermalText = label()
+        ramText = label()
 
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
             background = GradientDrawable().apply {
-                cornerRadius = dp(12).toFloat()
-                setColor(Color.argb(230, 20, 20, 30))
+                cornerRadius = dp(14).toFloat()
+                setColor(Color.argb(235, 16, 22, 34))
+                setStroke(dp(1), Color.argb(90, 34, 211, 238))
             }
             addView(appText)
-            addView(fpsText)
-            addView(tempText)
+            addView(batteryText)
+            addView(deviceText)
             addView(thermalText)
+            addView(ramText)
             visibility = View.GONE
         }
 
@@ -121,7 +149,7 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
-        layoutParams = WindowManager.LayoutParams(
+        windowParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
@@ -135,13 +163,7 @@ class OverlayService : Service() {
         }
 
         setupDragAndTap()
-        windowManager.addView(container, layoutParams)
-    }
-
-    private fun label(): TextView = TextView(this).apply {
-        setTextColor(Color.WHITE)
-        textSize = 13f
-        text = "--"
+        windowManager.addView(container, windowParams)
     }
 
     private fun setupDragAndTap() {
@@ -156,8 +178,8 @@ class OverlayService : Service() {
                 MotionEvent.ACTION_DOWN -> {
                     downRawX = event.rawX
                     downRawY = event.rawY
-                    startX = layoutParams.x
-                    startY = layoutParams.y
+                    startX = windowParams.x
+                    startY = windowParams.y
                     moved = false
                     true
                 }
@@ -165,9 +187,9 @@ class OverlayService : Service() {
                     val dx = (event.rawX - downRawX).toInt()
                     val dy = (event.rawY - downRawY).toInt()
                     if (abs(dx) > dp(6) || abs(dy) > dp(6)) moved = true
-                    layoutParams.x = startX + dx
-                    layoutParams.y = startY + dy
-                    windowManager.updateViewLayout(container, layoutParams)
+                    windowParams.x = startX + dx
+                    windowParams.y = startY + dy
+                    windowManager.updateViewLayout(container, windowParams)
                     true
                 }
                 MotionEvent.ACTION_UP -> {
@@ -182,16 +204,16 @@ class OverlayService : Service() {
         }
     }
 
-    private fun render(m: PerfSampler.Metrics) {
-        if (!::container.isInitialized) return
-        bubble.text = m.fps?.let { "%.0f".format(it) } ?: "--"
-        appText.text = "App: ${m.app ?: "none"}"
-        fpsText.text = when {
-            !m.shizukuReady -> "FPS: needs Shizuku running and granted"
-            m.fps == null -> "FPS: waiting for a game…"
-            else -> "FPS: %.1f".format(m.fps)
-        }
-        tempText.text = "Battery temp: ${m.batteryTempC?.let { "%.1f °C".format(it) } ?: "N/A"}"
-        thermalText.text = "Thermal: ${m.thermal}"
+    private fun render(s: PerfMonitor.Snapshot) {
+        if (!::bubble.isInitialized) return
+        bubble.text = s.batteryTempC?.let { "%.0f°".format(it) } ?: "--"
+        appText.text = "App: ${s.foregroundApp ?: "unknown (grant usage access)"}"
+        val batteryTemp = s.batteryTempC?.let { "%.1f °C".format(it) } ?: "—"
+        val batteryLevel = s.batteryPercent?.let { "$it%" } ?: "—"
+        val charging = if (s.charging) " ⚡" else ""
+        batteryText.text = "Battery: $batteryTemp · $batteryLevel$charging"
+        deviceText.text = "Device sensor: ${s.deviceTempC?.let { "%.1f °C".format(it) } ?: "n/a"}"
+        thermalText.text = "Thermal: ${s.thermal}"
+        ramText.text = "RAM used: ${s.ramUsedPercent?.let { "$it%" } ?: "—"}"
     }
 }
